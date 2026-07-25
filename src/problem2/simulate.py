@@ -8,14 +8,19 @@ from .model import FilterParams, MaintenanceSchedule
 
 
 def seasonal_effect(day_of_year: int, params: FilterParams) -> float:
-    """Compute seasonal component S(t) for given day of year (1-365)."""
+    """Compute seasonal component S(t) for given day of year (1-365).
+
+    Two-harmonic model matching Problem 1: annual + semiannual.
+    """
     day = float(day_of_year)
-    # Two-harmonic model matching Problem 1
-    amp = params.seasonal_amplitude
     peak = params.seasonal_peak_day
-    # Phase-shifted cosine: peak at `peak` day
-    phase = 2 * np.pi * (day - peak) / 365.25
-    return amp * np.cos(phase)
+    # Annual harmonic
+    phase1 = 2 * np.pi * (day - peak) / 365.25
+    annual = params.seasonal_amplitude * np.cos(phase1)
+    # Semiannual harmonic
+    phase2 = 4 * np.pi * (day - peak * 0.5) / 365.25
+    semi = params.semiannual_amplitude * np.cos(phase2)
+    return annual + semi
 
 
 def generate_maintenance_dates(
@@ -35,7 +40,6 @@ def generate_maintenance_dates(
     medium_count = 0
     while current_day < end_day:
         # Determine if next maintenance should be medium or major
-        medium_count += 1
         if medium_count >= schedule.medium_between_major_mean:
             # Major maintenance
             interval = max(
@@ -55,6 +59,7 @@ def generate_maintenance_dates(
             )
             current_day += int(round(interval))
             events.append((current_day, "中维护"))
+        medium_count += 1
 
     return events
 
@@ -83,17 +88,26 @@ def simulate_one_device(
         return d.timetuple().tm_yday
 
     # Initialize state at prediction start
-    # Estimate C and F from recent permeability and days since maintenance
+    # Use 85th percentile of season-adjusted P from warmup history (robust to seasonal troughs)
+    # This matches the backtest initialization method.
     day_of_year = _ordinal_to_doy(prediction_start_ordinal)
     S0 = seasonal_effect(day_of_year, params)
 
-    # C ≈ recent_level + current_fouling - S0
-    # Current fouling ≈ beta * days_since_maintenance
-    current_fouling = params.beta * params.days_since_maintenance
-    # Recent permeability ≈ C - F + S
-    # → C ≈ P_recent + F - S
-    C = params.recent_level + current_fouling - S0
-    F = current_fouling
+    if warmup_history and len(warmup_history) >= 30:
+        # Estimate C as upper envelope of recent season-adjusted permeability
+        recent = np.array(warmup_history[-90:])  # last ~90 days
+        # Approximate seasonal effects for each day (simplified: use average doy offset)
+        n = len(recent)
+        doys = [(day_of_year - n + i - 1) % 365 + 1 for i in range(n)]
+        S_arr = np.array([seasonal_effect(int(d), params) for d in doys])
+        P_sa = recent - S_arr
+        C = float(np.percentile(P_sa, 85))
+        F = max(C - (recent[-1] - S_arr[-1]), 0.0)
+    else:
+        # Fallback: use recent_level parameter
+        current_fouling = params.beta * params.days_since_maintenance
+        C = params.recent_level + current_fouling - S0
+        F = current_fouling
 
     # Generate maintenance schedule from prediction start
     maint_events = generate_maintenance_dates(
@@ -107,13 +121,8 @@ def simulate_one_device(
     major_count = 0
     maintenance_dates: list[int] = []
 
-    # Add aging noise per event (maintenance damage)
-    # Each maintenance causes ~ alpha * (days_between / events_per_year) damage
-    # Simplified: per-event C damage from envelope decline
-    events_per_year_estimate = 365.25 / (
-        (schedule.medium_interval_mean + schedule.major_interval_mean) / 2
-    )
-    damage_per_event = params.alpha * 365.25 / max(events_per_year_estimate, 1)
+    # Note: daily C -= alpha already accounts for the full annual envelope decline ED.
+    # No additional per-event damage is applied — alpha rate is the TOTAL irreversible loss.
 
     # Event pointer
     event_idx = 0
@@ -173,17 +182,13 @@ def simulate_one_device(
             if mtype == "中维护":
                 medium_count += 1
                 recovery = params.medium_recovery
-                # F reduction: recovery amount
-                # recovery is in permeability units; convert to F reduction
                 F = max(F - recovery * params.medium_retention, 0.0)
-                C = C - damage_per_event * 0.3  # medium causes less damage
             else:  # 大维护
                 major_count += 1
                 last_major_day = day
                 major_attempted_recently = True
                 recovery = params.major_recovery or params.medium_recovery * 1.2
                 F = max(F - recovery * (params.major_retention or 1.0), 0.0)
-                C = C - damage_per_event  # major causes more damage
 
         # Lifetime check (after at least 365 days of data)
         if len(window_365) >= 365:
@@ -247,20 +252,20 @@ def monte_carlo_simulate(
     trajectories = [] if save_trajectories > 0 else None
 
     for i in range(n_runs):
-        run_seed = int(seed + i * 1000 + hash(params.device) % 10000)
+        run_seed = int(seed + i * 1000 + int(params.device[1:]))
         run_rng = np.random.default_rng(run_seed)
 
         # Perturb parameters for this run (parameter uncertainty)
         from copy import deepcopy
 
         perturbed = deepcopy(params)
-        # Alpha: multiplicative noise (log-normal style)
+        # Alpha: multiplicative noise (log-normal, tighter for long-horizon stability)
         perturbed.alpha = max(
-            params.alpha * np.exp(run_rng.normal(0, 0.3)), 0.001
+            params.alpha * np.exp(run_rng.normal(0, 0.2)), 0.001
         )
-        # Beta: additive noise
+        # Beta: multiplicative noise (log-normal, same paradigm as alpha)
         perturbed.beta = max(
-            params.beta + run_rng.normal(0, params.beta * 0.15), 0.01
+            params.beta * np.exp(run_rng.normal(0, 0.15)), 0.001
         )
         # Medium recovery: additive noise
         perturbed.medium_recovery = max(

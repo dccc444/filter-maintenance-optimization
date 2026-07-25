@@ -25,6 +25,10 @@ class FilterParams:
     seasonal_amplitude: float
     # Seasonal peak day-of-year
     seasonal_peak_day: int
+    # Semiannual harmonic amplitude (from Problem 1 seasonality_summary)
+    semiannual_amplitude: float
+    # Semiannual phase offset (days relative to annual peak)
+    semiannual_phase_days: float
     # Medium maintenance: fraction of fouling cleared (0-1)
     medium_recovery: float
     # Medium maintenance: retention factor at 30 days
@@ -180,6 +184,8 @@ def estimate_params(
             beta=beta,
             seasonal_amplitude=seasonal_amp,
             seasonal_peak_day=seasonal_peak,
+            semiannual_amplitude=seasonality.get("semiannual_amplitude", 2.84),
+            semiannual_phase_days=seasonality.get("seasonal_peak_day", 234) * 0.5,
             medium_recovery=medium_gain,
             medium_retention=medium_retention,
             major_recovery=float(major_gain) if major_gain is not None else None,

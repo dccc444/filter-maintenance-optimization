@@ -20,10 +20,12 @@ from .simulate import generate_maintenance_dates, seasonal_effect
 
 def seasonal_effect_for_series(doys: np.ndarray, params) -> np.ndarray:
     """Vectorized seasonal effect for an array of day-of-year values."""
-    amp = params.seasonal_amplitude
     peak = params.seasonal_peak_day
-    phase = 2 * np.pi * (doys.astype(float) - peak) / 365.25
-    return amp * np.cos(phase)
+    phase1 = 2 * np.pi * (doys.astype(float) - peak) / 365.25
+    annual = params.seasonal_amplitude * np.cos(phase1)
+    phase2 = 4 * np.pi * (doys.astype(float) - peak * 0.5) / 365.25
+    semi = params.semiannual_amplitude * np.cos(phase2)
+    return annual + semi
 
 
 def backtest_one_device(
