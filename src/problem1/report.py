@@ -113,7 +113,7 @@ def build_report(results: AnalysisResults, path: Path) -> None:
         "",
         "## 4. 下降趋势与规律",
         "",
-        f"剔除季节项后，共获得 {len(cycle)} 个满足至少 14 个观测日且跨度不少于 14 天的维护周期。所有周期下降率的中位数为 {_fmt(cycle['decline_rate_per_day'].median(),3)} 透水率/日，四分位区间为 {_fmt(cycle['decline_rate_per_day'].quantile(.25),3)}—{_fmt(cycle['decline_rate_per_day'].quantile(.75),3)}。部分周期出现负下降率（即短期上升），说明季节、负荷、未记录的小维护和随机波动仍会影响单周期轨迹，因此寿命模型应使用分层参数和过程噪声，而不能给每台设备只拟合一条直线。",
+        f"剔除季节项后，共获得 {len(cycle)} 个满足至少 14 个观测日且跨度不少于 14 天的维护周期。所有周期的稳健斜率均表现为下降，下降率中位数为 {_fmt(cycle['decline_rate_per_day'].median(),3)} 透水率/日，四分位区间为 {_fmt(cycle['decline_rate_per_day'].quantile(.25),3)}—{_fmt(cycle['decline_rate_per_day'].quantile(.75),3)}，完整范围为 {_fmt(cycle['decline_rate_per_day'].min(),3)}—{_fmt(cycle['decline_rate_per_day'].max(),3)}。这说明维护间隔内透水率持续下降的规律具有稳定性，但下降速度在设备和周期之间差异明显，寿命模型应使用分层参数和过程噪声，而不能给每台设备只拟合一条直线。",
         "",
         _markdown_table(decline_by_device, ["device", "中位下降率"], 3),
         "",
