@@ -1,0 +1,17 @@
+{
+  "n_observations": 6878,
+  "base_parameters": 22,
+  "full_parameters": 26,
+  "ssr_without_season": 1202237.130105838,
+  "ssr_with_season": 506415.7774620297,
+  "relative_ssr_reduction": 0.5787721367269302,
+  "f_statistic": 2353.682547278483,
+  "df_numerator": 4,
+  "df_denominator": 6852,
+  "p_value": 0.0,
+  "seasonal_amplitude": 15.809602722652922,
+  "seasonal_peak_day": 234,
+  "seasonal_trough_day": 18,
+  "annual_amplitude": 15.11423400019288,
+  "semiannual_amplitude": 2.8355834199121417
+}

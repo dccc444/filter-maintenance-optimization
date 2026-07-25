@@ -1,0 +1,11 @@
+[project]
+name = "filter-maintenance-optimization"
+version = "0.1.0"
+description = "Mathematical modeling for wastewater filter degradation and maintenance"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
