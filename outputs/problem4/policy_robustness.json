@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "tested_price_factor_range": [
+    0.5,
+    1.5
+  ],
+  "near_optimal_definition": "relative regret <= 5%",
+  "base_price_result": {
+    "reoptimized_factory_annual_cost": 1484.8177586971306,
+    "problem3_plan_annual_cost": 1484.9917392289767,
+    "relative_regret": 0.00011717298693869072
+  },
+  "one_factor_applicability": [
+    {
+      "scenario_type": "购置价单因素",
+      "factor": "purchase_factor",
+      "near_optimal_lower_factor": 0.5,
+      "near_optimal_upper_factor": 1.5,
+      "near_optimal_lower_price": 150.0,
+      "near_optimal_upper_price": 450.0,
+      "maximum_regret_in_tested_range": 0.002220953499011136
+    },
+    {
+      "scenario_type": "中维护价单因素",
+      "factor": "medium_factor",
+      "near_optimal_lower_factor": 0.5,
+      "near_optimal_upper_factor": 1.5,
+      "near_optimal_lower_price": 1.5,
+      "near_optimal_upper_price": 4.5,
+      "maximum_regret_in_tested_range": 0.004888659892452422
+    },
+    {
+      "scenario_type": "大维护价单因素",
+      "factor": "major_factor",
+      "near_optimal_lower_factor": 0.5,
+      "near_optimal_upper_factor": 1.5,
+      "near_optimal_lower_price": 6.0,
+      "near_optimal_upper_price": 18.0,
+      "maximum_regret_in_tested_range": 0.00012749900762974213
+    }
+  ]
+}

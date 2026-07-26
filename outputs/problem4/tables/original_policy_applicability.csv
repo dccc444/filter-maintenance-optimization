@@ -1,0 +1,4 @@
+﻿scenario_type,factor,near_optimal_lower_factor,near_optimal_upper_factor,near_optimal_lower_price,near_optimal_upper_price,maximum_regret_in_tested_range
+购置价单因素,purchase_factor,0.5,1.5,150.0,450.0,0.002220953499011136
+中维护价单因素,medium_factor,0.5,1.5,1.5,4.5,0.004888659892452422
+大维护价单因素,major_factor,0.5,1.5,6.0,18.0,0.00012749900762974213
