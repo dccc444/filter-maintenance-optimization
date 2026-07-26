@@ -56,6 +56,12 @@ def build_report(results: AnalysisResults, path: Path) -> None:
     type_comparison = results.maintenance_comparison.loc[
         results.maintenance_comparison["metric"] == "counterfactual_gain_3d"
     ].iloc[0]
+    duration_summary = results.maintenance_duration_summary.set_index(
+        "maintenance_type"
+    )
+    slope_summary = results.maintenance_slope_change_summary.set_index(
+        "maintenance_type"
+    )
 
     lines = [
         "# 第一问：数据处理、透水率变化规律与维护影响",
@@ -70,6 +76,8 @@ def build_report(results: AnalysisResults, path: Path) -> None:
         "",
         f"10 台设备共有 {int(quality['rows'].sum()):,} 条时间记录，其中有效透水率 {int(quality['valid_values'].sum()):,} 条。各设备按完整日历小时计算的覆盖率在 {_fmt(quality['calendar_hour_coverage'].min()*100,1)}%—{_fmt(quality['calendar_hour_coverage'].max()*100,1)}% 之间；每日不少于 3 个有效小时的日尺度覆盖率为 {_fmt(quality['calendar_day_coverage'].min()*100,1)}%—{_fmt(quality['calendar_day_coverage'].max()*100,1)}%，因此主分析采用日中位数。",
         "",
+        f"设备内时间戳重复检查结果为 {int(quality['duplicate_timestamps'].sum())} 条；10 台设备均无重复时间戳，无需删除或合并重复记录。",
+        "",
         _markdown_table(
             quality.assign(
                 calendar_hour_coverage=quality["calendar_hour_coverage"] * 100,
@@ -81,6 +89,7 @@ def build_report(results: AnalysisResults, path: Path) -> None:
                 "rows",
                 "valid_values",
                 "missing_rate",
+                "duplicate_timestamps",
                 "calendar_hour_coverage",
                 "calendar_day_coverage",
                 "outliers_flagged",
@@ -129,6 +138,20 @@ def build_report(results: AnalysisResults, path: Path) -> None:
         "",
         f"两类维护 1—3 日效果的 Mann–Whitney 检验 p={_p_fmt(type_comparison['p_value'])}。由于大维护仅有 {int(type_comparison['major_n'])} 个有效事件，且通常在状态更差时被选择，不能仅根据样本均值断言哪类维护的物理清洗能力更强；事件研究已控制维护前局部趋势和共同季节项，但仍可能存在按设备状态选择维护类型的剩余混杂。",
         "",
+        "### 5.1 维护效果持续时间",
+        "",
+        "将维护后 1—3 日反事实恢复量记为初始效果，对事件曲线作 5 日滚动中位数平滑；当平滑效果连续 3 个可用观测点不高于初始效果的 20% 时，记为效果终点。观察在下一次维护前或数据结束时停止，未观察到终点的事件按右删失处理。",
+        "",
+        f"中维护共有 {int(duration_summary.loc['中维护','valid_duration_events'])} 个可分析事件，其中 {int(duration_summary.loc['中维护','right_censored_events'])} 个右删失，删失率 {_fmt(duration_summary.loc['中维护','right_censored_share']*100,1)}%；截至 60 日的限制平均持续时间为 {_fmt(duration_summary.loc['中维护','rmst_to_60_days'],1)} 日。大维护共有 {int(duration_summary.loc['大维护','valid_duration_events'])} 个可分析事件，其中 {int(duration_summary.loc['大维护','right_censored_events'])} 个右删失，删失率 {_fmt(duration_summary.loc['大维护','right_censored_share']*100,1)}%，截至 60 日的限制平均持续时间为 {_fmt(duration_summary.loc['大维护','rmst_to_60_days'],1)} 日。两类维护的 Kaplan–Meier 中位持续时间均未在当前随访内达到，说明多数维护效果至少保持到下一次维护，不能把随访末日误当作真实终点。",
+        "",
+        "![维护效果持续时间](figures/09_维护效果持续时间.png)",
+        "",
+        "### 5.2 维护前后下降速度变化",
+        "",
+        f"采用维护前 21 日和维护后第 4—24 日两个等长窗口分别估计 Theil–Sen 下降率。中维护有 {int(slope_summary.loc['中维护','n_events'])} 个有效事件、覆盖 {int(slope_summary.loc['中维护','n_devices'])} 台设备；设备中位变化为 {_fmt(slope_summary.loc['中维护','median_change'],3)} 透水率/日，设备聚类 Bootstrap 95% 区间为 [{_fmt(slope_summary.loc['中维护','cluster_ci95_low'],3)}, {_fmt(slope_summary.loc['中维护','cluster_ci95_high'],3)}]，设备级 Wilcoxon p={_p_fmt(slope_summary.loc['中维护','wilcoxon_device_p_value'])}。大维护对应中位变化为 {_fmt(slope_summary.loc['大维护','median_change'],3)}，95% 区间为 [{_fmt(slope_summary.loc['大维护','cluster_ci95_low'],3)}, {_fmt(slope_summary.loc['大维护','cluster_ci95_high'],3)}]，p={_p_fmt(slope_summary.loc['大维护','wilcoxon_device_p_value'])}。两类区间均跨 0，当前数据没有证据表明维护会系统性改变随后下降速度。",
+        "",
+        "![维护前后下降速度变化](figures/10_维护前后下降速度变化.png)",
+        "",
         "![维护事件研究](figures/05_维护事件研究.png)",
         "",
         "![维护效果分布](figures/06_维护效果分布.png)",
@@ -144,8 +167,10 @@ def build_report(results: AnalysisResults, path: Path) -> None:
         "5. **30 日保持率 MP30**：第 27—30 日维护效应/1—3 日恢复量；",
         "6. **上包络衰减 ED**：维护后 1—7 日水平随年份变化斜率的相反数；",
         "7. **波动指数 VI**：控制设备、长期趋势、维护时钟和季节项后的残差标准差。",
+        "8. **维护效果持续时间 TE**：维护效果持续高于初始恢复量 20% 的时间；存在下一次维护造成的右删失。",
+        "9. **下降率变化 ΔDR**：维护后等长窗口下降率减去维护前下降率；按设备聚类评估不确定性。",
         "",
-        "这些指标保留物理含义，不强行压缩为单一综合分数。第二问可将 DR、SA、MG、MP30、ED 和 VI 分别映射到堵塞增长、季节函数、维护恢复、维护保持、不可逆老化和过程噪声参数。",
+        "这些指标保留物理含义，不强行压缩为单一综合分数。第二问可将 DR、SA、MG、TE、ED 和 VI 分别映射到堵塞增长、季节函数、维护恢复、恢复持续性、不可逆老化和过程噪声参数；ΔDR 的区间跨 0，因此当前模型不需要为维护后另设确定性堵塞增长率。",
         "",
         _markdown_table(
             indicators,
@@ -171,8 +196,10 @@ def build_report(results: AnalysisResults, path: Path) -> None:
         "2. 控制设备差异、长期趋势和维护时钟后，年/半年季节项显著，但受限于只有约两年数据，外推时必须保留不确定性。",
         "3. 透水率呈“维护后跳升—周期内下降”的锯齿形；周期下降率存在明显设备差异与周期差异。",
         "4. 中维护和大维护总体均能带来短期恢复，但大维护样本少且存在状态选择偏差，第二问应采用跨设备共享信息的分层估计。",
-        "5. 维护后上包络线并非恒定，说明只建模可逆堵塞不足，必须同时引入不可逆老化/维护损伤状态。",
-        "6. `tables/device_indicators.csv`、`tables/cycle_slopes.csv`、`tables/maintenance_event_metrics.csv` 和 `processed/daily_permeability.csv` 构成第二问的直接数据接口。",
+        "5. 多数事件在下一次维护前仍未降到初始效果的 20%，持续时间中位数受右删失而不可识别；第二问应把维护视为对堵塞状态的持久清除，而不是用 MP30 乘在瞬时恢复量上。",
+        "6. 维护前后等长窗口下降率变化的设备聚类区间均跨 0，暂无证据支持维护后采用另一套固定堵塞增长率。",
+        "7. 维护后上包络线并非恒定，说明只建模可逆堵塞不足，必须同时引入不可逆老化/维护损伤状态。",
+        "8. `tables/device_indicators.csv`、`tables/maintenance_effect_duration.csv`、`tables/maintenance_slope_change.csv` 和 `processed/daily_permeability.csv` 构成第二问的直接数据接口。",
         "",
         "## 8. 局限性",
         "",

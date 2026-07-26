@@ -287,6 +287,68 @@ def plot_indicator_heatmap(results: AnalysisResults, output_dir: Path) -> None:
     _save(fig, output_dir / "08_设备指标热力图.png")
 
 
+def plot_maintenance_duration(results: AnalysisResults, output_dir: Path) -> None:
+    frame = results.maintenance_duration_survival
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    for maintenance_type in MAINTENANCE_ORDER:
+        subset = frame.loc[
+            frame["maintenance_type"] == maintenance_type
+        ].sort_values("time")
+        if subset.empty:
+            continue
+        ax.step(
+            subset["time"],
+            subset["survival"],
+            where="post",
+            color=COLORS[maintenance_type],
+            linewidth=2,
+            label=maintenance_type,
+        )
+    ax.axhline(0.5, color="#777777", linestyle="--", linewidth=0.8)
+    ax.set_xlim(left=0)
+    ax.set_ylim(0, 1.03)
+    ax.set_xlabel("维护效果已持续时间（天）")
+    ax.set_ylabel("效果仍高于初始恢复量 20% 的概率")
+    ax.set_title("维护效果持续时间 Kaplan–Meier 曲线（下一次维护处右删失）")
+    ax.legend()
+    _save(fig, output_dir / "09_维护效果持续时间.png")
+
+
+def plot_maintenance_slope_change(
+    results: AnalysisResults, output_dir: Path
+) -> None:
+    frame = results.maintenance_slope_change.dropna(
+        subset=["decline_rate_change"]
+    )
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    sns.boxplot(
+        data=frame,
+        x="maintenance_type",
+        y="decline_rate_change",
+        order=MAINTENANCE_ORDER,
+        palette=COLORS,
+        hue="maintenance_type",
+        legend=False,
+        showfliers=False,
+        ax=ax,
+    )
+    sns.stripplot(
+        data=frame,
+        x="maintenance_type",
+        y="decline_rate_change",
+        order=MAINTENANCE_ORDER,
+        color="#333333",
+        alpha=0.45,
+        size=3,
+        ax=ax,
+    )
+    ax.axhline(0, color="#555555", linestyle="--", linewidth=0.9)
+    ax.set_xlabel("维护类型")
+    ax.set_ylabel("维护后下降率 − 维护前下降率（透水率/日）")
+    ax.set_title("维护前后等长窗口下降速度变化")
+    _save(fig, output_dir / "10_维护前后下降速度变化.png")
+
+
 def make_all_plots(results: AnalysisResults, output_dir: Path) -> None:
     configure_style()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -298,3 +360,5 @@ def make_all_plots(results: AnalysisResults, output_dir: Path) -> None:
     plot_event_gains(results, output_dir)
     plot_envelope(results, output_dir)
     plot_indicator_heatmap(results, output_dir)
+    plot_maintenance_duration(results, output_dir)
+    plot_maintenance_slope_change(results, output_dir)

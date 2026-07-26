@@ -1,4 +1,4 @@
-"""Backtest: validate the dual-state model against historical data."""
+"""Leakage-free temporal backtest for the Problem 2 state model."""
 
 from __future__ import annotations
 
@@ -7,174 +7,227 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.problem1.analysis import (
+    add_maintenance_clock,
+    envelope_decay,
+    estimate_cycle_slopes,
+    event_study,
+    fit_seasonality,
+)
+
 from .model import (
     DEVICE_ORDER,
-    estimate_params,
-    extract_maintenance_schedule,
+    FilterParams,
     load_daily_permeability,
-    load_seasonality_summary,
-    load_warmup_history,
+    load_maintenance_records,
 )
-from .simulate import generate_maintenance_dates, seasonal_effect
+from .simulate import seasonal_effect
 
 
-def seasonal_effect_for_series(doys: np.ndarray, params) -> np.ndarray:
-    """Vectorized seasonal effect for an array of day-of-year values."""
-    peak = params.seasonal_peak_day
-    phase1 = 2 * np.pi * (doys.astype(float) - peak) / 365.25
-    annual = params.seasonal_amplitude * np.cos(phase1)
-    phase2 = 4 * np.pi * (doys.astype(float) - peak * 0.5) / 365.25
-    semi = params.semiannual_amplitude * np.cos(phase2)
-    return annual + semi
+def _training_params(
+    daily: pd.DataFrame,
+    maintenance: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    damage_share: float = 0.20,
+) -> dict[str, FilterParams]:
+    """Estimate all parameters using observations strictly before ``cutoff``."""
+    train_daily = daily.loc[daily["date"] < cutoff].copy()
+    train_maintenance = maintenance.loc[maintenance["date"] < cutoff].copy()
+    clocked = add_maintenance_clock(train_daily, train_maintenance)
+    season_frame, _, details = fit_seasonality(clocked)
+    coefficient_rows = details.loc[details["table"] == "coefficients"]
+    coefficients = coefficient_rows.set_index("term")["coefficient"].to_dict()
+    slopes = estimate_cycle_slopes(season_frame)
+    _, event_metrics, _ = event_study(season_frame, train_maintenance)
+    _, envelopes = envelope_decay(season_frame, train_maintenance)
+
+    positive_ed = envelopes.loc[
+        envelopes["envelope_decline_per_year"] > 0,
+        "envelope_decline_per_year",
+    ]
+    population_ed = float(positive_ed.median()) if len(positive_ed) else 10.0
+    population_medium = float(
+        event_metrics.loc[
+            event_metrics["maintenance_type"] == "中维护",
+            "counterfactual_gain_3d",
+        ].median()
+    )
+    population_major = float(
+        event_metrics.loc[
+            event_metrics["maintenance_type"] == "大维护",
+            "counterfactual_gain_3d",
+        ].median()
+    )
+    population_decline = float(slopes["decline_rate_per_day"].median())
+    params: dict[str, FilterParams] = {}
+
+    for device in DEVICE_ORDER:
+        dev_daily = season_frame.loc[season_frame["device"] == device].sort_values(
+            "date"
+        )
+        dev_maint = train_maintenance.loc[
+            train_maintenance["device"] == device
+        ].sort_values("date")
+        dev_slope = slopes.loc[
+            slopes["device"] == device, "decline_rate_per_day"
+        ]
+        decline = (
+            float(dev_slope.median()) if len(dev_slope) else population_decline
+        )
+        dev_envelope = envelopes.loc[
+            envelopes["device"] == device, "envelope_decline_per_year"
+        ]
+        ed = float(dev_envelope.iloc[0]) if len(dev_envelope) else population_ed
+        if not np.isfinite(ed) or ed <= 0:
+            ed = population_ed
+        ed = float(np.clip(ed, 2.0, 3.0 * population_ed))
+        span_years = max(
+            (dev_daily["date"].max() - dev_daily["date"].min()).days / 365.25,
+            0.5,
+        )
+        medium_per_year = (
+            (dev_maint["maintenance_type"] == "中维护").sum() / span_years
+        )
+        major_per_year = (
+            (dev_maint["maintenance_type"] == "大维护").sum() / span_years
+        )
+        weight = medium_per_year + 3.0 * major_per_year
+        medium_damage = ed * damage_share / weight if weight else 0.0
+        alpha = ed * (1.0 - damage_share) / 365.25
+
+        dev_events = event_metrics.loc[event_metrics["device"] == device]
+        medium_values = dev_events.loc[
+            dev_events["maintenance_type"] == "中维护",
+            "counterfactual_gain_3d",
+        ]
+        major_values = dev_events.loc[
+            dev_events["maintenance_type"] == "大维护",
+            "counterfactual_gain_3d",
+        ]
+        medium_gain = (
+            float(medium_values.median())
+            if medium_values.notna().any()
+            else population_medium
+        )
+        major_gain = (
+            float(major_values.median())
+            if major_values.notna().any()
+            else population_major
+        )
+        sigma = float(dev_daily["model_residual"].std())
+        recent_level = float(
+            dev_daily.tail(30)["permeability_median"].median()
+        )
+        last_event = dev_maint.iloc[-1] if len(dev_maint) else None
+        days_since = (
+            float((cutoff - last_event["date"]).days)
+            if last_event is not None
+            else 30.0
+        )
+        mediums_since_major = 0
+        for mtype in reversed(dev_maint["maintenance_type"].tolist()):
+            if mtype == "大维护":
+                break
+            mediums_since_major += int(mtype == "中维护")
+        params[device] = FilterParams(
+            device=device,
+            alpha=alpha,
+            beta=max(decline - alpha, 0.01),
+            seasonal_sin_1y=float(coefficients["sin_1y"]),
+            seasonal_cos_1y=float(coefficients["cos_1y"]),
+            seasonal_sin_2y=float(coefficients["sin_2y"]),
+            seasonal_cos_2y=float(coefficients["cos_2y"]),
+            medium_recovery=max(medium_gain, 1.0),
+            major_recovery=max(major_gain, 1.0),
+            medium_damage=max(medium_damage, 0.0),
+            major_damage=max(3.0 * medium_damage, 0.0),
+            sigma=max(sigma, 0.1),
+            recent_level=recent_level,
+            days_since_maintenance=days_since,
+            mediums_since_major=mediums_since_major,
+            last_maintenance_type=(
+                str(last_event["maintenance_type"])
+                if last_event is not None
+                else "观测起点"
+            ),
+            historical_irreversible_decline_per_year=ed,
+            damage_share_assumption=damage_share,
+        )
+    return params
 
 
 def backtest_one_device(
     device: str,
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
-    params,
-    schedule,
+    params: FilterParams,
     daily: pd.DataFrame,
     maintenance: pd.DataFrame,
     rng: np.random.Generator,
 ) -> pd.DataFrame:
-    """Simulate from start_date to end_date and compare with actual data.
-
-    Returns DataFrame with columns: date, actual_P, predicted_P, C, F, S, maintenance_type
-    """
-    from datetime import date, timedelta
-
-    _epoch = date(1899, 12, 30)
-
-    def _ordinal_to_doy(ordinal: int) -> int:
-        d = _epoch + timedelta(days=ordinal)
-        return d.timetuple().tm_yday
-
-    def _date_to_ordinal(d: pd.Timestamp) -> int:
-        return (d.date() - _epoch).days
-
-    start_ord = _date_to_ordinal(start_date)
-    end_ord = _date_to_ordinal(end_date)
-
-    # Get device data
-    dev_data = daily[
+    """Simulate with actual future maintenance dates and training-only params."""
+    epoch = pd.Timestamp("1899-12-30")
+    start_ord = int((start_date - epoch).days)
+    end_ord = int((end_date - epoch).days)
+    pre = daily.loc[
         (daily["device"] == device)
-        & (daily["date"] >= start_date - pd.Timedelta(days=90))
-        & (daily["date"] <= end_date)
-    ].sort_values("date")
-
-    # Get maintenance records up to start_date
-    dev_maint = maintenance[
-        (maintenance["device"] == device) & (maintenance["date"] <= start_date)
-    ].sort_values("date")
-
-    # Compute days since last maintenance at start_date
-    if len(dev_maint) > 0:
-        last_maint_date = dev_maint["date"].max()
-        days_since = (start_date - last_maint_date).days
+        & (daily["date"] < start_date)
+        & (daily["date"] >= start_date - pd.Timedelta(days=int(90))),
+        ["date", "permeability_median"],
+    ].dropna()
+    if len(pre) >= 10:
+        doys = pre["date"].dt.dayofyear.to_numpy(dtype=int)
+        seasonal = np.array([seasonal_effect(day, params) for day in doys])
+        adjusted = pre["permeability_median"].to_numpy(dtype=float) - seasonal
+        C = float(np.percentile(adjusted, 85))
+        F = max(C - adjusted[-1], 0.0)
     else:
-        days_since = 30  # fallback
+        start_season = seasonal_effect(start_date.dayofyear, params)
+        F = max(params.beta * params.days_since_maintenance, 0.0)
+        C = params.recent_level + F - start_season
 
-    # Initialize state from actual data near start_date
-    # Use season-adjusted permeability to estimate C and F robustly
-    pre_start = dev_data[dev_data["date"] < start_date]
-
-    if len(pre_start) >= 20:
-        # Compute approximate season-adjusted values
-        pre_dates = pre_start["date"]
-        pre_values = pre_start["permeability_median"].dropna()
-
-        if len(pre_values) >= 10:
-            # Estimate C as the 90th percentile of (P - Ŝ) in pre-period
-            # (capacity = near-peak season-adjusted permeability)
-            doys = pre_dates.dt.dayofyear.to_numpy()
-            # Approximate seasonal effect using simple harmonic
-            S_approx = seasonal_effect_for_series(doys, params)
-            P_sa = pre_values.to_numpy() - S_approx[:len(pre_values)]
-
-            # C ≈ upper envelope of season-adjusted P
-            C0 = float(np.percentile(P_sa, 85))
-            # F ≈ C - P_sa at the most recent point
-            recent_sa = P_sa[-1]
-            F0 = max(C0 - recent_sa, 0.0)
-            recent_P = pre_values.iloc[-1]
-        else:
-            recent_P = params.recent_level
-            doy0 = _ordinal_to_doy(start_ord)
-            S0 = seasonal_effect(doy0, params)
-            F0 = params.beta * min(days_since, 90)
-            C0 = recent_P + F0 - S0
-    else:
-        recent_P = params.recent_level
-        doy0 = _ordinal_to_doy(start_ord)
-        S0 = seasonal_effect(doy0, params)
-        F0 = params.beta * min(days_since, 90)
-        C0 = recent_P + F0 - S0
-
-    # Generate maintenance schedule
-    # For backtest: use ACTUAL historical maintenance dates, not random ones
-    future_maint = maintenance[
+    events = maintenance.loc[
         (maintenance["device"] == device)
-        & (maintenance["date"] > start_date)
+        & (maintenance["date"] >= start_date)
         & (maintenance["date"] <= end_date)
     ]
-    # Build event dict with actual dates
-    event_dict = {}
-    for _, row in future_maint.iterrows():
-        ord_val = _date_to_ordinal(row["date"])
-        event_dict[ord_val] = row["maintenance_type"]
-
-    # Simulate
-    C, F = C0, F0
-    day = start_ord
+    event_dict = {
+        int((row["date"] - epoch).days): row["maintenance_type"]
+        for _, row in events.iterrows()
+    }
     records = []
-
-    while day <= end_ord:
-        doy = _ordinal_to_doy(day)
-        S = seasonal_effect(doy, params)
-
-        # Evolution
-        aging_noise = rng.normal(0, max(params.alpha, 0.001) * 0.5)
-        fouling_noise = rng.normal(0, params.beta * 0.3)
-        obs_noise = rng.normal(0, params.sigma)
-
-        C = C - params.alpha + aging_noise
-        F = max(F + params.beta + fouling_noise, 0.0)
-        P = C - F + S + obs_noise
-
-        # Maintenance
-        mtype = event_dict.get(day, None)
-        if mtype:
-            recovery = (
-                params.medium_recovery
-                if mtype == "中维护"
-                else (params.major_recovery or params.medium_recovery * 1.2)
-            )
-            F = max(F - recovery, 0.0)
-
-        current_date = _epoch + timedelta(days=day)
+    for ordinal in range(start_ord, end_ord + 1):
+        current_date = epoch + pd.Timedelta(days=int(ordinal))
+        C = C - params.alpha + rng.normal(0, max(params.alpha, 0.001) * 0.5)
+        F = max(F + params.beta + rng.normal(0, params.beta * 0.3), 0.0)
+        predicted = (
+            C
+            - F
+            + seasonal_effect(current_date.dayofyear, params)
+            + rng.normal(0, params.sigma)
+        )
+        event_type = event_dict.get(ordinal)
+        if event_type == "中维护":
+            C -= params.medium_damage
+            F = max(F - params.medium_recovery, 0.0)
+        elif event_type == "大维护":
+            C -= params.major_damage
+            F = max(F - params.major_recovery, 0.0)
         records.append(
             {
+                "device": device,
                 "date": current_date,
-                "predicted_P": P,
+                "predicted_P": predicted,
                 "C": C,
                 "F": F,
-                "S": S,
-                "maintenance": mtype,
+                "maintenance": event_type,
             }
         )
-        day += 1
-
-    sim_df = pd.DataFrame(records)
-    sim_df["date"] = pd.to_datetime(sim_df["date"])
-
-    # Merge with actual data
-    actual = dev_data[["date", "permeability_median"]].copy()
-    actual = actual.rename(columns={"permeability_median": "actual_P"})
-
-    merged = sim_df.merge(actual, on="date", how="left")
-    merged["device"] = device
-    return merged
+    result = pd.DataFrame(records)
+    actual = daily.loc[
+        daily["device"] == device, ["date", "permeability_median"]
+    ].rename(columns={"permeability_median": "actual_P"})
+    return result.merge(actual, on="date", how="left")
 
 
 def run_backtest(
@@ -185,37 +238,30 @@ def run_backtest(
     n_runs: int = 100,
     seed: int = 2026,
 ) -> pd.DataFrame:
-    """Run backtest for all devices, averaging over multiple MC runs."""
-    seasonality = load_seasonality_summary(tables_dir)
-    params = estimate_params(tables_dir, processed_dir, seasonality)
-    schedules = extract_maintenance_schedule(processed_dir)
+    del tables_dir  # retained for CLI compatibility
     daily = load_daily_permeability(processed_dir)
-    maintenance = pd.read_csv(
-        processed_dir / "maintenance_records.csv", parse_dates=["date"]
-    )
-
+    maintenance = load_maintenance_records(processed_dir)
     start_date = pd.Timestamp(backtest_start)
     end_date = pd.Timestamp(backtest_end)
-
-    all_runs = []
+    params = _training_params(daily, maintenance, start_date)
+    all_devices = []
     for device in DEVICE_ORDER:
-        print(f"  Backtesting {device}...")
-        p = params[device]
-        s = schedules[device]
-
-        device_runs = []
-        for i in range(n_runs):
-            run_rng = np.random.default_rng(seed + i * 1000)
-            result = backtest_one_device(
-                device, start_date, end_date, p, s, daily, maintenance, run_rng
+        runs = []
+        for index in range(n_runs):
+            run = backtest_one_device(
+                device,
+                start_date,
+                end_date,
+                params[device],
+                daily,
+                maintenance,
+                np.random.default_rng(seed + index * 1000 + int(device[1:])),
             )
-            result["run"] = i
-            device_runs.append(result)
-
-        # Average across runs
-        all_device = pd.concat(device_runs, ignore_index=True)
-        avg = (
-            all_device.groupby(["device", "date"])
+            run["run"] = index
+            runs.append(run)
+        combined = pd.concat(runs, ignore_index=True)
+        average = (
+            combined.groupby(["device", "date"])
             .agg(
                 predicted_P_mean=("predicted_P", "mean"),
                 predicted_P_std=("predicted_P", "std"),
@@ -224,40 +270,29 @@ def run_backtest(
                 actual_P=("actual_P", "first"),
                 C_mean=("C", "mean"),
                 F_mean=("F", "mean"),
-                S_mean=("S", "mean"),
             )
             .reset_index()
         )
-        all_runs.append(avg)
-
-    return pd.concat(all_runs, ignore_index=True)
+        all_devices.append(average)
+    return pd.concat(all_devices, ignore_index=True)
 
 
 def compute_backtest_metrics(results: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-device error metrics."""
     records = []
     for device, group in results.groupby("device"):
         valid = group.dropna(subset=["actual_P", "predicted_P_mean"])
-        if len(valid) < 10:
-            continue
         errors = valid["actual_P"] - valid["predicted_P_mean"]
-        mae = float(errors.abs().mean())
-        rmse = float(np.sqrt((errors**2).mean()))
-        # Coverage: fraction of actual values within 90% prediction interval
         in_interval = (valid["actual_P"] >= valid["predicted_P_q05"]) & (
             valid["actual_P"] <= valid["predicted_P_q95"]
         )
-        coverage = float(in_interval.mean())
-        # Bias
-        bias = float(errors.mean())
         records.append(
             {
                 "device": device,
                 "n_days": len(valid),
-                "MAE": mae,
-                "RMSE": rmse,
-                "bias": bias,
-                "coverage_90pct": coverage,
+                "MAE": float(errors.abs().mean()),
+                "RMSE": float(np.sqrt(np.mean(errors**2))),
+                "bias": float(errors.mean()),
+                "coverage_90pct": float(in_interval.mean()),
             }
         )
     return pd.DataFrame(records)
@@ -266,7 +301,7 @@ def compute_backtest_metrics(results: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Backtest Problem 2 model")
+    parser = argparse.ArgumentParser(description="Leakage-free Problem 2 backtest")
     parser.add_argument("--tables-dir", type=Path, default=Path("outputs/problem1/tables"))
     parser.add_argument("--processed-dir", type=Path, default=Path("outputs/problem1/processed"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/problem2"))
@@ -274,10 +309,8 @@ def main() -> None:
     parser.add_argument("--end", default="2026-04-10")
     parser.add_argument("--n-runs", type=int, default=100)
     args = parser.parse_args()
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Backtest: {args.start} → {args.end} ({args.n_runs} MC runs)")
+    tables = args.output_dir / "tables"
+    tables.mkdir(parents=True, exist_ok=True)
     results = run_backtest(
         args.tables_dir,
         args.processed_dir,
@@ -285,28 +318,12 @@ def main() -> None:
         args.end,
         args.n_runs,
     )
-
     metrics = compute_backtest_metrics(results)
-    print("\n=== Backtest Metrics ===")
-    print(
-        f"{'Device':<8} {'n_days':>6} {'MAE':>8} {'RMSE':>8} {'Bias':>8} {'Coverage':>10}"
-    )
-    print("-" * 55)
-    for _, row in metrics.iterrows():
-        print(
-            f"{row['device']:<8} {row['n_days']:>6.0f} "
-            f"{row['MAE']:>8.2f} {row['RMSE']:>8.2f} "
-            f"{row['bias']:>8.2f} {row['coverage_90pct']:>10.2f}"
-        )
-
-    # Save
-    metrics.to_csv(
-        args.output_dir / "tables" / "backtest_metrics.csv", index=False, encoding="utf-8-sig"
-    )
+    metrics.to_csv(tables / "backtest_metrics.csv", index=False, encoding="utf-8-sig")
     results.to_csv(
-        args.output_dir / "tables" / "backtest_trajectories.csv", index=False, encoding="utf-8-sig"
+        tables / "backtest_trajectories.csv", index=False, encoding="utf-8-sig"
     )
-    print(f"\nSaved to {args.output_dir}")
+    print(metrics.to_string(index=False))
 
 
 if __name__ == "__main__":

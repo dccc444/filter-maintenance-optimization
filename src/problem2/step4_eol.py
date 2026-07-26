@@ -215,6 +215,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "tables").mkdir(parents=True, exist_ok=True)
 
     results = evaluate_end_of_life_status(args.processed_dir, args.tables_dir)
 

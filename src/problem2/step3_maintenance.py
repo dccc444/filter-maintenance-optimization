@@ -132,6 +132,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "tables").mkdir(parents=True, exist_ok=True)
 
     results = analyse_maintenance_patterns(args.processed_dir)
 

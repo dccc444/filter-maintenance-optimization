@@ -431,14 +431,200 @@ def _event_effects_for_one(
     return curve, metrics
 
 
+def estimate_effect_duration(
+    curve: pd.DataFrame,
+    initial_gain: float,
+    threshold_ratio: float = 0.2,
+    smooth_window: int = 5,
+    persistence_points: int = 3,
+) -> dict:
+    """Estimate an event-effect duration with explicit right censoring.
+
+    The endpoint is the first of ``persistence_points`` consecutive usable
+    observations whose centered rolling-median effect is no more than the
+    selected fraction of the initial 1--3 day gain. Requiring persistence
+    prevents a single noisy observation from ending the event.
+    """
+    post = curve.loc[curve["relative_day"] >= 1].sort_values("relative_day").copy()
+    followup_days = int(post["relative_day"].max()) if not post.empty else 0
+    threshold = (
+        float(threshold_ratio * initial_gain)
+        if np.isfinite(initial_gain) and initial_gain > 0
+        else np.nan
+    )
+    result = {
+        "effective_duration_days": np.nan,
+        "duration_censored": False,
+        "duration_status": "nonpositive_initial_gain",
+        "duration_threshold": threshold,
+        "duration_threshold_ratio": threshold_ratio,
+        "duration_followup_days": followup_days,
+    }
+    if not np.isfinite(threshold):
+        return result
+
+    post["effect_smooth"] = post["effect"].rolling(
+        window=smooth_window, center=True, min_periods=min(3, smooth_window)
+    ).median()
+    usable = post.dropna(subset=["effect_smooth"]).copy()
+    if usable.empty:
+        result["duration_status"] = "insufficient_followup"
+        return result
+
+    qualifying = usable["effect_smooth"].le(threshold).to_numpy()
+    days = usable["relative_day"].to_numpy(dtype=int)
+    for end in range(persistence_points - 1, len(usable)):
+        start = end - persistence_points + 1
+        if qualifying[start : end + 1].all() and days[end] - days[start] <= 4:
+            result.update(
+                {
+                    "effective_duration_days": int(days[start]),
+                    "duration_censored": False,
+                    "duration_status": "threshold_crossed",
+                }
+            )
+            return result
+
+    result.update(
+        {
+            "effective_duration_days": followup_days,
+            "duration_censored": True,
+            "duration_status": "right_censored",
+        }
+    )
+    return result
+
+
+def _kaplan_meier(
+    durations: pd.Series,
+    censored: pd.Series,
+) -> pd.DataFrame:
+    """Return a compact Kaplan--Meier table for right-censored durations."""
+    frame = pd.DataFrame(
+        {
+            "duration": pd.to_numeric(durations, errors="coerce"),
+            "censored": censored.astype(bool),
+        }
+    ).dropna()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["time", "at_risk", "events", "censored", "survival"]
+        )
+    survival = 1.0
+    records = [
+        {
+            "time": 0,
+            "at_risk": len(frame),
+            "events": 0,
+            "censored": 0,
+            "survival": survival,
+        }
+    ]
+    for time in sorted(frame["duration"].unique()):
+        at_risk = int((frame["duration"] >= time).sum())
+        at_time = frame.loc[frame["duration"] == time]
+        events = int((~at_time["censored"]).sum())
+        n_censored = int(at_time["censored"].sum())
+        if at_risk and events:
+            survival *= 1.0 - events / at_risk
+        records.append(
+            {
+                "time": float(time),
+                "at_risk": at_risk,
+                "events": events,
+                "censored": n_censored,
+                "survival": float(survival),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def summarize_effect_duration(
+    duration: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summaries = []
+    survival_tables = []
+    for maintenance_type in MAINTENANCE_ORDER:
+        subset = duration.loc[
+            (duration["maintenance_type"] == maintenance_type)
+            & duration["duration_status"].isin(["threshold_crossed", "right_censored"])
+        ].copy()
+        km = _kaplan_meier(
+            subset["effective_duration_days"], subset["duration_censored"]
+        )
+        if not km.empty:
+            km.insert(0, "maintenance_type", maintenance_type)
+            survival_tables.append(km)
+        median_rows = km.loc[km["survival"] <= 0.5] if not km.empty else km
+        km_median = (
+            float(median_rows.iloc[0]["time"]) if len(median_rows) else np.nan
+        )
+        horizon = min(60.0, float(subset["effective_duration_days"].max())) if len(subset) else 0.0
+        rmst = 0.0
+        if len(km) and horizon > 0:
+            ordered = km.sort_values("time")
+            previous_time = 0.0
+            previous_survival = 1.0
+            for _, row in ordered.iloc[1:].iterrows():
+                current = min(float(row["time"]), horizon)
+                rmst += max(current - previous_time, 0.0) * previous_survival
+                previous_time = current
+                previous_survival = float(row["survival"])
+                if current >= horizon:
+                    break
+            if previous_time < horizon:
+                rmst += (horizon - previous_time) * previous_survival
+        uncensored = subset.loc[~subset["duration_censored"], "effective_duration_days"]
+        summaries.append(
+            {
+                "maintenance_type": maintenance_type,
+                "n_events": len(
+                    duration.loc[duration["maintenance_type"] == maintenance_type]
+                ),
+                "valid_duration_events": len(subset),
+                "right_censored_events": int(subset["duration_censored"].sum()),
+                "right_censored_share": (
+                    float(subset["duration_censored"].mean()) if len(subset) else np.nan
+                ),
+                "km_median_duration_days": km_median,
+                "rmst_to_60_days": rmst if horizon else np.nan,
+                "median_duration_uncensored": (
+                    float(uncensored.median()) if len(uncensored) else np.nan
+                ),
+                "q25_duration_uncensored": (
+                    float(uncensored.quantile(0.25)) if len(uncensored) else np.nan
+                ),
+                "q75_duration_uncensored": (
+                    float(uncensored.quantile(0.75)) if len(uncensored) else np.nan
+                ),
+            }
+        )
+    survival = (
+        pd.concat(survival_tables, ignore_index=True)
+        if survival_tables
+        else pd.DataFrame()
+    )
+    return pd.DataFrame(summaries), survival
+
+
 def event_study(
     season_frame: pd.DataFrame, maintenance: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     curves = []
     metrics = []
-    for event_id, event in maintenance.reset_index(drop=True).iterrows():
+    events = maintenance.sort_values(["device", "date"]).reset_index(drop=True).copy()
+    events["next_event_date"] = events.groupby("device")["date"].shift(-1)
+    for event_id, event in events.iterrows():
         device_daily = season_frame.loc[season_frame["device"] == event["device"]]
-        result = _event_effects_for_one(device_daily, event["date"])
+        data_end = device_daily["date"].max()
+        days_to_end = max(int((data_end - event["date"]).days), 0)
+        days_to_next = (
+            max(int((event["next_event_date"] - event["date"]).days) - 1, 0)
+            if pd.notna(event["next_event_date"])
+            else days_to_end
+        )
+        max_day = min(90, days_to_end, days_to_next)
+        result = _event_effects_for_one(device_daily, event["date"], max_day=max_day)
         if result is None:
             continue
         curve, record = result
@@ -453,8 +639,24 @@ def event_study(
                 "device": event["device"],
                 "event_date": event["date"],
                 "maintenance_type": event["maintenance_type"],
+                "next_event_date": event["next_event_date"],
             }
         )
+        for ratio, suffix in [(0.1, "10"), (0.2, "20"), (0.3, "30")]:
+            duration_metrics = estimate_effect_duration(
+                curve,
+                initial_gain=record["counterfactual_gain_3d"],
+                threshold_ratio=ratio,
+            )
+            if ratio == 0.2:
+                record.update(duration_metrics)
+            else:
+                record[f"effective_duration_days_{suffix}pct"] = duration_metrics[
+                    "effective_duration_days"
+                ]
+                record[f"duration_censored_{suffix}pct"] = duration_metrics[
+                    "duration_censored"
+                ]
         metrics.append(record)
     curves_df = pd.concat(curves, ignore_index=True)
     metrics_df = pd.DataFrame(metrics)
@@ -490,6 +692,96 @@ def event_study(
             )
     summary_df = pd.DataFrame(summaries)
     return curves_df, metrics_df, summary_df
+
+
+def build_maintenance_slope_change(
+    season_frame: pd.DataFrame,
+    maintenance: pd.DataFrame,
+    window_days: int = 21,
+) -> pd.DataFrame:
+    """Compare matched pre/post robust slopes around each maintenance event."""
+    records = []
+    for event_id, event in maintenance.sort_values(
+        ["device", "date"]
+    ).reset_index(drop=True).iterrows():
+        dev = season_frame.loc[season_frame["device"] == event["device"]].copy()
+        relative = (dev["date"] - event["date"]).dt.days
+        pre = dev.loc[
+            relative.between(-window_days, -1),
+            ["date", "permeability_season_adjusted"],
+        ].dropna()
+        post = dev.loc[
+            relative.between(4, window_days + 3),
+            ["date", "permeability_season_adjusted"],
+        ].dropna()
+
+        def robust_decline(frame: pd.DataFrame) -> tuple[float, int, float]:
+            if len(frame) < 10:
+                return np.nan, len(frame), 0.0
+            elapsed = (frame["date"] - frame["date"].min()).dt.days.to_numpy(dtype=float)
+            span = float(elapsed.max()) if len(elapsed) else 0.0
+            if span < 14:
+                return np.nan, len(frame), span
+            slope, *_ = stats.theilslopes(
+                frame["permeability_season_adjusted"].to_numpy(dtype=float), elapsed
+            )
+            return float(-slope), len(frame), span
+
+        pre_rate, pre_n, pre_span = robust_decline(pre)
+        post_rate, post_n, post_span = robust_decline(post)
+        records.append(
+            {
+                "event_id": event_id,
+                "device": event["device"],
+                "event_date": event["date"],
+                "maintenance_type": event["maintenance_type"],
+                "window_days": window_days,
+                "pre_decline_rate": pre_rate,
+                "post_decline_rate": post_rate,
+                "decline_rate_change": post_rate - pre_rate,
+                "pre_observed_days": pre_n,
+                "post_observed_days": post_n,
+                "pre_span_days": pre_span,
+                "post_span_days": post_span,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def summarize_slope_changes(frame: pd.DataFrame) -> pd.DataFrame:
+    """Summarize event changes using device-cluster bootstrap and device tests."""
+    rng = np.random.default_rng(RANDOM_SEED)
+    records = []
+    for maintenance_type in MAINTENANCE_ORDER:
+        subset = frame.loc[frame["maintenance_type"] == maintenance_type].dropna(
+            subset=["pre_decline_rate", "post_decline_rate", "decline_rate_change"]
+        )
+        device_values = subset.groupby("device")["decline_rate_change"].median()
+        values = device_values.to_numpy(dtype=float)
+        if not len(values):
+            continue
+        boot = rng.choice(values, size=(4000, len(values)), replace=True)
+        boot_median = np.median(boot, axis=1)
+        nonzero = values[np.abs(values) > 1e-12]
+        p_value = (
+            float(stats.wilcoxon(nonzero).pvalue) if len(nonzero) >= 2 else np.nan
+        )
+        records.append(
+            {
+                "maintenance_type": maintenance_type,
+                "n_events": len(subset),
+                "n_devices": len(values),
+                "pre_decline_median": float(subset["pre_decline_rate"].median()),
+                "post_decline_median": float(subset["post_decline_rate"].median()),
+                "median_change": float(np.median(values)),
+                "mean_change": float(np.mean(values)),
+                "cluster_ci95_low": float(np.quantile(boot_median, 0.025)),
+                "cluster_ci95_high": float(np.quantile(boot_median, 0.975)),
+                "wilcoxon_device_p_value": p_value,
+                "faster_device_share": float(np.mean(values > 0)),
+            }
+        )
+    return pd.DataFrame(records)
 
 
 def event_curve_summary(curves: pd.DataFrame) -> pd.DataFrame:
@@ -630,6 +922,8 @@ def build_indicator_table(
     event_metrics: pd.DataFrame,
     envelope_summary: pd.DataFrame,
     device_seasonality: pd.DataFrame,
+    maintenance_duration: pd.DataFrame,
+    maintenance_slope_change: pd.DataFrame,
 ) -> pd.DataFrame:
     indicators = quality.loc[
         :, ["device", "calendar_hour_coverage", "missing_rate", "outliers_flagged"]
@@ -692,6 +986,42 @@ def build_indicator_table(
     )
     indicators = indicators.merge(residual, on="device", how="left")
     indicators = indicators.merge(recent, on="device", how="left")
+    duration_valid = maintenance_duration.loc[
+        maintenance_duration["duration_status"].isin(
+            ["threshold_crossed", "right_censored"]
+        )
+    ]
+    for maintenance_type, prefix in [("中维护", "medium"), ("大维护", "major")]:
+        duration_device = (
+            duration_valid.loc[
+                duration_valid["maintenance_type"] == maintenance_type
+            ]
+            .groupby("device")
+            .agg(
+                **{
+                    f"{prefix}_duration_observed_median": (
+                        "effective_duration_days",
+                        "median",
+                    ),
+                    f"{prefix}_duration_censored_share": (
+                        "duration_censored",
+                        "mean",
+                    ),
+                }
+            )
+            .reset_index()
+        )
+        slope_device = (
+            maintenance_slope_change.loc[
+                maintenance_slope_change["maintenance_type"] == maintenance_type
+            ]
+            .groupby("device")["decline_rate_change"]
+            .median()
+            .rename(f"{prefix}_decline_rate_change_median")
+            .reset_index()
+        )
+        indicators = indicators.merge(duration_device, on="device", how="left")
+        indicators = indicators.merge(slope_device, on="device", how="left")
     for col in ["medium_events", "major_events"]:
         if col in indicators:
             indicators[col] = indicators[col].fillna(0).astype(int)
@@ -726,6 +1056,11 @@ class AnalysisResults:
     event_summary: pd.DataFrame
     event_curve_summary: pd.DataFrame
     maintenance_comparison: pd.DataFrame
+    maintenance_duration: pd.DataFrame
+    maintenance_duration_summary: pd.DataFrame
+    maintenance_duration_survival: pd.DataFrame
+    maintenance_slope_change: pd.DataFrame
+    maintenance_slope_change_summary: pd.DataFrame
     envelope_points: pd.DataFrame
     envelope_summary: pd.DataFrame
     indicators: pd.DataFrame
@@ -746,6 +1081,30 @@ def run_analysis(data_dir: Path) -> AnalysisResults:
     )
     curve_summary = event_curve_summary(event_curves)
     maintenance_comparison = compare_maintenance_types(event_metrics)
+    maintenance_duration = event_metrics.loc[
+        :,
+        [
+            "event_id",
+            "device",
+            "event_date",
+            "maintenance_type",
+            "counterfactual_gain_3d",
+            "effective_duration_days",
+            "duration_censored",
+            "duration_status",
+            "duration_threshold",
+            "duration_followup_days",
+            "effective_duration_days_10pct",
+            "duration_censored_10pct",
+            "effective_duration_days_30pct",
+            "duration_censored_30pct",
+        ],
+    ].copy()
+    duration_summary, duration_survival = summarize_effect_duration(
+        maintenance_duration
+    )
+    slope_change = build_maintenance_slope_change(season_frame, maintenance)
+    slope_change_summary = summarize_slope_changes(slope_change)
     envelope_points, envelope_summary = envelope_decay(season_frame, maintenance)
     per_device_season = device_seasonal_amplitudes(daily)
     indicators = build_indicator_table(
@@ -755,6 +1114,8 @@ def run_analysis(data_dir: Path) -> AnalysisResults:
         event_metrics,
         envelope_summary,
         per_device_season,
+        maintenance_duration,
+        slope_change,
     )
     return AnalysisResults(
         hourly=hourly,
@@ -771,6 +1132,11 @@ def run_analysis(data_dir: Path) -> AnalysisResults:
         event_summary=event_summary,
         event_curve_summary=curve_summary,
         maintenance_comparison=maintenance_comparison,
+        maintenance_duration=maintenance_duration,
+        maintenance_duration_summary=duration_summary,
+        maintenance_duration_survival=duration_survival,
+        maintenance_slope_change=slope_change,
+        maintenance_slope_change_summary=slope_change_summary,
         envelope_points=envelope_points,
         envelope_summary=envelope_summary,
         indicators=indicators,

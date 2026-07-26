@@ -7,6 +7,8 @@ from src.problem1.analysis import (
     _event_effects_for_one,
     add_maintenance_clock,
     aggregate_daily,
+    build_maintenance_slope_change,
+    estimate_effect_duration,
     normalize_device,
 )
 
@@ -76,3 +78,52 @@ def test_counterfactual_event_gain_on_synthetic_data() -> None:
     assert abs(metrics["counterfactual_gain_3d"] - 15.0) < 1e-8
     assert abs(metrics["effect_day30"] - 15.0) < 1e-8
 
+
+def test_effect_duration_requires_persistent_crossing() -> None:
+    curve = pd.DataFrame(
+        {
+            "relative_day": np.arange(1, 16),
+            "effect": [10, 10, 9, 8, 1, 8, 7, 6, 1, 1, 1, 0.5, 0.5, 0.5, 0.5],
+        }
+    )
+    result = estimate_effect_duration(
+        curve, initial_gain=10.0, threshold_ratio=0.2, smooth_window=1
+    )
+    assert result["duration_status"] == "threshold_crossed"
+    assert result["effective_duration_days"] == 9
+    assert not result["duration_censored"]
+
+
+def test_effect_duration_reports_right_censoring() -> None:
+    curve = pd.DataFrame(
+        {"relative_day": np.arange(1, 11), "effect": np.full(10, 8.0)}
+    )
+    result = estimate_effect_duration(curve, initial_gain=10.0)
+    assert result["duration_status"] == "right_censored"
+    assert result["effective_duration_days"] == 10
+    assert result["duration_censored"]
+
+
+def test_matched_slope_change_uses_equal_windows() -> None:
+    dates = pd.date_range("2025-01-01", periods=80)
+    event_date = dates[39]
+    relative = (dates - event_date).days.to_numpy()
+    values = np.where(relative < 0, 100 - 0.2 * relative, 115 - 0.1 * relative)
+    season_frame = pd.DataFrame(
+        {
+            "device": "A1",
+            "date": dates,
+            "permeability_season_adjusted": values,
+        }
+    )
+    maintenance = pd.DataFrame(
+        {
+            "device": ["A1"],
+            "date": [event_date],
+            "maintenance_type": ["中维护"],
+        }
+    )
+    result = build_maintenance_slope_change(season_frame, maintenance)
+    assert abs(result.loc[0, "pre_decline_rate"] - 0.2) < 1e-8
+    assert abs(result.loc[0, "post_decline_rate"] - 0.1) < 1e-8
+    assert abs(result.loc[0, "decline_rate_change"] + 0.1) < 1e-8

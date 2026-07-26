@@ -14,9 +14,18 @@ import pandas as pd
 # Style: match Problem 1 aesthetic
 # Use CJK-capable font
 import matplotlib.font_manager as fm
-cjk_fonts = [f.name for f in fm.fontManager.ttflist if 'CJK' in f.name or 'WenQuanYi' in f.name]
-if cjk_fonts:
-    plt.rcParams["font.family"] = cjk_fonts[0]
+font_path = Path(r"C:\Windows\Fonts\msyh.ttc")
+if font_path.exists():
+    fm.fontManager.addfont(str(font_path))
+    plt.rcParams["font.family"] = fm.FontProperties(fname=str(font_path)).get_name()
+else:
+    cjk_fonts = [
+        f.name
+        for f in fm.fontManager.ttflist
+        if "CJK" in f.name or "WenQuanYi" in f.name
+    ]
+    if cjk_fonts:
+        plt.rcParams["font.family"] = cjk_fonts[0]
 plt.rcParams.update({
     "figure.dpi": 150,
     "font.size": 9,
@@ -31,7 +40,7 @@ plt.rcParams.update({
 
 def fig01_parameter_heatmap(output_dir: Path) -> None:
     """Device-level parameter comparison heatmap."""
-    params = pd.read_csv("outputs/problem2/tables/model_parameters.csv").set_index("device")
+    params = pd.read_csv(output_dir.parent / "tables" / "model_parameters.csv").set_index("device")
 
     columns = {
         "alpha_per_day": "α (老化率)",
@@ -69,12 +78,17 @@ def fig01_parameter_heatmap(output_dir: Path) -> None:
 
 def fig02_lifetime_predictions(output_dir: Path) -> None:
     """Lifetime prediction bar chart with CI."""
-    preds = pd.read_csv("outputs/problem2/tables/lifetime_predictions.csv")
+    preds = pd.read_csv(output_dir.parent / "tables" / "lifetime_predictions.csv")
 
     devices = preds["device"].tolist()
     median = preds["median_lifetime_days"].values / 365.25
     ci_low = preds["ci95_low_days"].values / 365.25
-    ci_high = preds["ci95_high_days"].values / 365.25
+    ci_high = (
+        preds["ci95_high_days"]
+        .fillna(preds["max_followup_days"])
+        .values
+        / 365.25
+    )
 
     yerr_low = median - ci_low
     yerr_high = ci_high - median
@@ -116,7 +130,7 @@ def fig02_lifetime_predictions(output_dir: Path) -> None:
 
 def fig03_maintenance_intervals(output_dir: Path) -> None:
     """Maintenance interval distribution per device."""
-    patterns = pd.read_csv("outputs/problem2/tables/maintenance_patterns.csv")
+    patterns = pd.read_csv(output_dir.parent / "tables" / "maintenance_patterns.csv")
     devices = patterns["device"].tolist()
 
     med_mean = patterns["medium_interval_mean"].values
@@ -154,7 +168,7 @@ def fig03_maintenance_intervals(output_dir: Path) -> None:
 
 def fig04_eol_status(output_dir: Path) -> None:
     """End-of-life status: distance to threshold."""
-    eol = pd.read_csv("outputs/problem2/tables/eol_status.csv")
+    eol = pd.read_csv(output_dir.parent / "tables" / "eol_status.csv")
     devices = eol["device"].tolist()
     annual = eol["current_annual_mean"].values
     threshold = 37
@@ -190,7 +204,7 @@ def fig04_eol_status(output_dir: Path) -> None:
 def fig05_monthly_maintenance(output_dir: Path) -> None:
     """Monthly maintenance distribution."""
     import json
-    with open("outputs/problem2/tables/maintenance_patterns.json") as f:
+    with open(output_dir.parent / "tables" / "maintenance_patterns.json", encoding="utf-8") as f:
         data = json.load(f)
 
     monthly = data["monthly_distribution"]

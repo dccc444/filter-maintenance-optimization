@@ -1,0 +1,3 @@
+﻿maintenance_type,n_events,valid_duration_events,right_censored_events,right_censored_share,km_median_duration_days,rmst_to_60_days,median_duration_uncensored,q25_duration_uncensored,q75_duration_uncensored
+中维护,107,104,94,0.9038461538461539,,56.790811130573395,26.5,26.0,32.0
+大维护,17,17,16,0.9411764705882353,,57.0625,13.0,13.0,13.0

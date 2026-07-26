@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "purpose": "第三问维护策略优化与第四问长期风险评估的统一输入接口",
+  "simulation_entrypoint": "src.problem2.simulate.simulate_one_device",
+  "prediction_start": "2026-04-10",
+  "end_of_life_rule": {
+    "annual_window_days": 365,
+    "permeability_threshold": 37.0,
+    "post_major_window_days": 30,
+    "logic": "annual_mean_below_threshold AND post_major_mean_below_threshold"
+  },
+  "baseline": {
+    "maintenance_damage_share": 0.2,
+    "maximum_followup_years": 25,
+    "monte_carlo_runs_per_device": 1000,
+    "costs": {
+      "purchase": 300.0,
+      "medium_maintenance": 3.0,
+      "major_maintenance": 12.0
+    }
+  },
+  "required_sensitivity_scenarios": {
+    "maintenance_damage_share": [
+      0.0,
+      0.2,
+      0.4
+    ],
+    "devices_without_observed_major_maintenance": [
+      "A4",
+      "A8"
+    ],
+    "right_censoring": "use event_observed and Kaplan-Meier summaries"
+  },
+  "policy_variables": [
+    "medium_gap_mean",
+    "major_gap_mean",
+    "medium_between_major"
+  ],
+  "outputs": [
+    "total_lifetime_days",
+    "event_observed",
+    "right_censored",
+    "medium_maintenance_count",
+    "major_maintenance_count",
+    "mean_simulated_permeability",
+    "final_annual_mean",
+    "post_major_30d_mean",
+    "total_cost",
+    "annualized_cost"
+  ],
+  "device_parameter_table": "tables/model_parameters.csv",
+  "baseline_lifetime_table": "tables/lifetime_predictions.csv",
+  "validation_table": "tables/backtest_metrics.csv"
+}

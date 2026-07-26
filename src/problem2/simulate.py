@@ -1,235 +1,225 @@
-""""Monte Carlo simulation engine for filter lifetime prediction."""
+"""Monte Carlo simulator for filter lifetime and maintenance policy analysis."""
 
 from __future__ import annotations
+
+from copy import deepcopy
+from datetime import date, timedelta
 
 import numpy as np
 
 from .model import FilterParams, MaintenanceSchedule
 
+EXCEL_EPOCH = date(1899, 12, 30)
+
+
+def _ordinal_to_doy(ordinal: int) -> int:
+    return (EXCEL_EPOCH + timedelta(days=int(ordinal))).timetuple().tm_yday
+
 
 def seasonal_effect(day_of_year: int, params: FilterParams) -> float:
-    """Compute seasonal component S(t) for given day of year (1-365).
-
-    Two-harmonic model matching Problem 1: annual + semiannual.
-    """
+    """Evaluate the exact four-coefficient harmonic model from Problem 1."""
     day = float(day_of_year)
-    peak = params.seasonal_peak_day
-    # Annual harmonic
-    phase1 = 2 * np.pi * (day - peak) / 365.25
-    annual = params.seasonal_amplitude * np.cos(phase1)
-    # Semiannual harmonic
-    phase2 = 4 * np.pi * (day - peak * 0.5) / 365.25
-    semi = params.semiannual_amplitude * np.cos(phase2)
-    return annual + semi
+    return float(
+        params.seasonal_sin_1y * np.sin(2 * np.pi * day / 365.25)
+        + params.seasonal_cos_1y * np.cos(2 * np.pi * day / 365.25)
+        + params.seasonal_sin_2y * np.sin(4 * np.pi * day / 365.25)
+        + params.seasonal_cos_2y * np.cos(4 * np.pi * day / 365.25)
+    )
 
 
 def generate_maintenance_dates(
-    start_date: int,  # ordinal day
+    start_date: int,
     schedule: MaintenanceSchedule,
     rng: np.random.Generator,
-    max_years: int = 10,
+    max_years: int = 25,
+    days_since_last: float = 0.0,
+    mediums_since_major: int = 0,
 ) -> list[tuple[int, str]]:
-    """Generate maintenance event dates following the fixed schedule pattern.
-
-    Returns list of (day_ordinal, '中维护'/'大维护').
-    """
+    """Continue the observed fixed schedule from the current maintenance state."""
     events: list[tuple[int, str]] = []
-    current_day = start_date
-    end_day = start_date + int(max_years * 365.25)
-
-    medium_count = 0
+    current_day = int(start_date)
+    end_day = int(start_date + max_years * 365.25)
+    medium_count = int(max(mediums_since_major, 0))
+    first = True
     while current_day < end_day:
-        # Determine if next maintenance should be medium or major
-        if medium_count >= schedule.medium_between_major_mean:
-            # Major maintenance
-            interval = max(
-                30,
-                rng.normal(schedule.major_interval_mean, schedule.major_interval_std),
+        is_major = medium_count >= schedule.medium_between_major
+        if is_major:
+            full_gap = max(
+                14.0,
+                float(rng.normal(schedule.major_gap_mean, schedule.major_gap_std)),
             )
-            current_day += int(round(interval))
-            events.append((current_day, "大维护"))
+            event_type = "大维护"
+        else:
+            full_gap = max(
+                14.0,
+                float(rng.normal(schedule.medium_gap_mean, schedule.medium_gap_std)),
+            )
+            event_type = "中维护"
+        remaining = full_gap - days_since_last if first else full_gap
+        gap = max(int(round(remaining)), 1)
+        current_day += gap
+        if current_day > end_day:
+            break
+        events.append((current_day, event_type))
+        if event_type == "大维护":
             medium_count = 0
         else:
-            # Medium maintenance
-            interval = max(
-                14,
-                rng.normal(
-                    schedule.medium_interval_mean, schedule.medium_interval_std
-                ),
-            )
-            current_day += int(round(interval))
-            events.append((current_day, "中维护"))
-        medium_count += 1
-
+            medium_count += 1
+        first = False
     return events
+
+
+def expected_post_major_mean(
+    C: float,
+    F: float,
+    day: int,
+    params: FilterParams,
+    window_days: int = 30,
+    maintenance_already_applied: bool = False,
+) -> float:
+    """Expected mean permeability after a hypothetical major maintenance."""
+    projected_C = C
+    projected_F = F
+    if not maintenance_already_applied:
+        projected_C -= params.major_damage
+        projected_F = max(projected_F - params.major_recovery, 0.0)
+    values = []
+    for offset in range(1, window_days + 1):
+        projected_C -= params.alpha
+        projected_F = max(projected_F + params.beta, 0.0)
+        values.append(
+            projected_C
+            - projected_F
+            + seasonal_effect(_ordinal_to_doy(day + offset), params)
+        )
+    return float(np.mean(values))
 
 
 def simulate_one_device(
     params: FilterParams,
     schedule: MaintenanceSchedule,
     rng: np.random.Generator,
-    prediction_start_ordinal: int = 46122,  # 2026-04-10 (Excel epoch)
+    prediction_start_ordinal: int = 46122,
     warmup_history: list[float] | None = None,
     return_trajectory: bool = False,
-    debug: bool = False,
+    threshold: float = 37.0,
+    recovery_window_days: int = 30,
+    max_years: int = 25,
+    purchase_cost: float = 300.0,
+    medium_cost: float = 3.0,
+    major_cost: float = 12.0,
 ) -> dict:
-    """Simulate one filter device from prediction start to end-of-life.
-
-    warmup_history: last 365 days of actual daily permeability to
-    pre-populate the sliding window (prevents cold-start bias).
-    """
-    from datetime import date, timedelta
-
-    _epoch = date(1899, 12, 30)
-
-    def _ordinal_to_doy(ordinal: int) -> int:
-        """Convert Excel ordinal to day-of-year (1-366)."""
-        d = _epoch + timedelta(days=ordinal)
-        return d.timetuple().tm_yday
-
-    # Initialize state at prediction start
-    # Use 85th percentile of season-adjusted P from warmup history (robust to seasonal troughs)
-    # This matches the backtest initialization method.
-    day_of_year = _ordinal_to_doy(prediction_start_ordinal)
-    S0 = seasonal_effect(day_of_year, params)
-
+    """Simulate one device until the two-condition end-of-life rule or censoring."""
+    start_day = int(prediction_start_ordinal)
+    start_doy = _ordinal_to_doy(start_day)
+    S0 = seasonal_effect(start_doy, params)
     if warmup_history and len(warmup_history) >= 30:
-        # Estimate C as upper envelope of recent season-adjusted permeability
-        recent = np.array(warmup_history[-90:])  # last ~90 days
-        # Approximate seasonal effects for each day (simplified: use average doy offset)
+        recent = np.asarray(warmup_history[-90:], dtype=float)
         n = len(recent)
-        doys = [(day_of_year - n + i - 1) % 365 + 1 for i in range(n)]
-        S_arr = np.array([seasonal_effect(int(d), params) for d in doys])
-        P_sa = recent - S_arr
-        C = float(np.percentile(P_sa, 85))
-        F = max(C - (recent[-1] - S_arr[-1]), 0.0)
+        doys = [
+            _ordinal_to_doy(start_day - n + index + 1) for index in range(n)
+        ]
+        season = np.array([seasonal_effect(day, params) for day in doys])
+        adjusted = recent - season
+        C = float(np.percentile(adjusted, 85))
+        F = max(C - adjusted[-1], 0.0)
     else:
-        # Fallback: use recent_level parameter
-        current_fouling = params.beta * params.days_since_maintenance
-        C = params.recent_level + current_fouling - S0
-        F = current_fouling
+        F = max(params.beta * params.days_since_maintenance, 0.0)
+        C = params.recent_level + F - S0
 
-    # Generate maintenance schedule from prediction start
-    maint_events = generate_maintenance_dates(
-        prediction_start_ordinal, schedule, rng, max_years=15
+    events = generate_maintenance_dates(
+        start_day,
+        schedule,
+        rng,
+        max_years=max_years,
+        days_since_last=params.days_since_maintenance,
+        mediums_since_major=params.mediums_since_major,
     )
-
-    # Tracking
-    daily_P: list[float] = []
+    event_idx = 0
+    window_365 = list(warmup_history[-365:]) if warmup_history else []
+    daily_p: list[float] = []
     daily_day: list[int] = []
     medium_count = 0
     major_count = 0
-    maintenance_dates: list[int] = []
+    terminated = False
+    final_post_major_mean = np.nan
+    day = start_day
+    max_days = int(round(max_years * 365.25))
 
-    # Note: daily C -= alpha already accounts for the full annual envelope decline ED.
-    # No additional per-event damage is applied — alpha rate is the TOTAL irreversible loss.
-
-    # Event pointer
-    event_idx = 0
-    event_dates = [e[0] for e in maint_events]
-    event_types = [e[1] for e in maint_events]
-
-    # Simulation loop
-    day = prediction_start_ordinal
-    max_days = 365 * 12  # 12 years max
-
-    # Pre-populate 365-day window with historical data (cold-start fix)
-    window_365: list[float] = []
-    if warmup_history:
-        window_365 = list(warmup_history[-365:])
-    else:
-        window_365 = []
-
-    last_major_day = prediction_start_ordinal
-    major_attempted_recently = False
-
-    for step in range(max_days):
-        doy = _ordinal_to_doy(day)
-        S = seasonal_effect(doy, params)
-
-        # State evolution — noise decomposition:
-        #   aging_noise: proportional to aging rate (tiny, smooth decline)
-        #   fouling_noise: proportional to fouling rate (moderate daily variation)
-        #   obs_noise: the bulk of residual volatility (iid measurement/process noise)
-        sigma_total = params.sigma
-        aging_noise = rng.normal(0, max(params.alpha, 0.001) * 0.5)
-        fouling_noise = rng.normal(0, params.beta * 0.3)
-        obs_noise = rng.normal(0, sigma_total)
-
-        # Irreversible aging: slow, small daily decline
-        C = C - params.alpha + aging_noise
-
-        # Reversible fouling: grows daily, can fluctuate (negative = brief cleaning)
-        F = max(F + params.beta + fouling_noise, 0.0)
-
-        # Observed permeability
-        P = C - F + S + obs_noise
-
-        daily_P.append(P)
+    for _ in range(max_days):
+        major_today = False
+        C = C - params.alpha + rng.normal(0, max(params.alpha, 0.001) * 0.5)
+        F = max(F + params.beta + rng.normal(0, params.beta * 0.3), 0.0)
+        P = (
+            C
+            - F
+            + seasonal_effect(_ordinal_to_doy(day), params)
+            + rng.normal(0, params.sigma)
+        )
+        daily_p.append(float(P))
         daily_day.append(day)
-
-        # 365-day sliding window
-        window_365.append(P)
-        while len(window_365) > 365:
+        window_365.append(float(P))
+        if len(window_365) > 365:
             window_365.pop(0)
 
-        # Check if maintenance event occurs today
-        if event_idx < len(event_dates) and day >= event_dates[event_idx]:
-            mtype = event_types[event_idx]
+        while event_idx < len(events) and day >= events[event_idx][0]:
+            event_type = events[event_idx][1]
             event_idx += 1
-            maintenance_dates.append(day)
-
-            if mtype == "中维护":
+            if event_type == "中维护":
                 medium_count += 1
-                recovery = params.medium_recovery
-                F = max(F - recovery * params.medium_retention, 0.0)
-            else:  # 大维护
+                C -= params.medium_damage
+                F = max(F - params.medium_recovery, 0.0)
+            else:
                 major_count += 1
-                last_major_day = day
-                major_attempted_recently = True
-                recovery = params.major_recovery or params.medium_recovery * 1.2
-                F = max(F - recovery * (params.major_retention or 1.0), 0.0)
+                C -= params.major_damage
+                F = max(F - params.major_recovery, 0.0)
+                major_today = True
 
-        # Lifetime check (after at least 365 days of data)
-        if len(window_365) >= 365:
-            annual_mean = sum(window_365) / len(window_365)
-
-            # Condition 1: annual mean < 37
-            if annual_mean < 37:
-                # Condition 2: even major maintenance wouldn't recover
-                # Simulate: if we did major maintenance now
-                simulated_recovery = params.major_recovery or params.medium_recovery * 1.2
-                simulated_F = max(F - simulated_recovery, 0.0)
-                # Post-major P estimate (30-day window after repair)
-                post_major_estimate = C - simulated_F + S
-                if post_major_estimate < 37:
-                    break
-
+        if len(window_365) == 365 and float(np.mean(window_365)) < threshold:
+            final_post_major_mean = expected_post_major_mean(
+                C,
+                F,
+                day,
+                params,
+                window_days=recovery_window_days,
+                maintenance_already_applied=major_today,
+            )
+            if final_post_major_mean < threshold:
+                terminated = True
+                break
         day += 1
 
-    # Compute results
-    total_days = day - prediction_start_ordinal
-    lifetime_ordinal = day
-
-    # Convert ordinal to date (Excel epoch: 1899-12-30)
-    epoch = date(1899, 12, 30)
-    start_date_obj = epoch + timedelta(days=prediction_start_ordinal)
-    end_date_obj = epoch + timedelta(days=lifetime_ordinal)
-
+    observed_days = int(day - start_day)
+    if not terminated:
+        observed_days = max_days
+        day = start_day + max_days
+    total_cost = purchase_cost + medium_count * medium_cost + major_count * major_cost
+    years = max(observed_days / 365.25, 1 / 365.25)
     result = {
         "device": params.device,
-        "total_lifetime_days": total_days,
-        "start_date": start_date_obj.isoformat(),
-        "end_date": end_date_obj.isoformat(),
-        "remaining_days": total_days,
+        "total_lifetime_days": observed_days,
+        "event_observed": terminated,
+        "right_censored": not terminated,
+        "start_date": (EXCEL_EPOCH + timedelta(days=start_day)).isoformat(),
+        "end_date": (EXCEL_EPOCH + timedelta(days=day)).isoformat(),
         "medium_maintenance_count": medium_count,
         "major_maintenance_count": major_count,
-        "final_annual_mean": float(sum(window_365[-365:]) / 365) if len(window_365) >= 365 else None,
+        "final_annual_mean": (
+            float(np.mean(window_365)) if len(window_365) == 365 else np.nan
+        ),
+        "post_major_30d_mean": final_post_major_mean,
+        "mean_simulated_permeability": (
+            float(np.mean(daily_p)) if daily_p else np.nan
+        ),
         "final_C": float(C),
         "final_F": float(F),
+        "total_cost": float(total_cost),
+        "annualized_cost": float(total_cost / years),
+        "threshold": threshold,
+        "terminated_by_two_condition_rule": terminated,
     }
     if return_trajectory:
-        result["daily_P"] = daily_P
+        result["daily_P"] = daily_p
         result["daily_day"] = daily_day
     return result
 
@@ -241,100 +231,97 @@ def monte_carlo_simulate(
     seed: int = 2026,
     warmup_history: list[float] | None = None,
     save_trajectories: int = 0,
+    **simulation_options,
 ) -> tuple[list[dict], list[dict] | None]:
-    """Run Monte Carlo simulation for one device.
-
-    If save_trajectories > 0, also save that many sample trajectories.
-    Returns (results, trajectories_or_None).
-    """
-    rng = np.random.default_rng(seed)
-    results = []
-    trajectories = [] if save_trajectories > 0 else None
-
-    for i in range(n_runs):
-        run_seed = int(seed + i * 1000 + int(params.device[1:]))
-        run_rng = np.random.default_rng(run_seed)
-
-        # Perturb parameters for this run (parameter uncertainty)
-        from copy import deepcopy
-
+    results: list[dict] = []
+    trajectories = [] if save_trajectories else None
+    for index in range(n_runs):
+        run_rng = np.random.default_rng(
+            seed + index * 1000 + int(params.device[1:])
+        )
         perturbed = deepcopy(params)
-        # Alpha: multiplicative noise (log-normal, tighter for long-horizon stability)
-        perturbed.alpha = max(
-            params.alpha * np.exp(run_rng.normal(0, 0.2)), 0.001
-        )
-        # Beta: multiplicative noise (log-normal, same paradigm as alpha)
-        perturbed.beta = max(
-            params.beta * np.exp(run_rng.normal(0, 0.15)), 0.001
-        )
-        # Medium recovery: additive noise
+        shared_irreversible = np.exp(run_rng.normal(0, 0.20))
+        perturbed.alpha = max(params.alpha * shared_irreversible, 0.0005)
+        perturbed.beta = max(params.beta * np.exp(run_rng.normal(0, 0.15)), 0.001)
         perturbed.medium_recovery = max(
-            params.medium_recovery + run_rng.normal(0, params.medium_recovery * 0.2),
-            1.0,
+            params.medium_recovery * np.exp(run_rng.normal(0, 0.20)), 1.0
         )
-        # Major recovery
-        if perturbed.major_recovery is not None:
-            perturbed.major_recovery = max(
-                perturbed.major_recovery
-                + run_rng.normal(0, perturbed.major_recovery * 0.2),
-                1.0,
-            )
-
+        perturbed.major_recovery = max(
+            params.major_recovery * np.exp(run_rng.normal(0, 0.20)), 1.0
+        )
+        perturbed.medium_damage = max(
+            params.medium_damage * shared_irreversible * np.exp(run_rng.normal(0, 0.25)),
+            0.0,
+        )
+        perturbed.major_damage = max(
+            params.major_damage * shared_irreversible * np.exp(run_rng.normal(0, 0.25)),
+            0.0,
+        )
         result = simulate_one_device(
             perturbed,
             schedule,
             run_rng,
             warmup_history=warmup_history,
-            return_trajectory=(save_trajectories > 0 and i < save_trajectories),
+            return_trajectory=bool(save_trajectories and index < save_trajectories),
+            **simulation_options,
         )
         results.append(result)
-
-        if save_trajectories > 0 and i < save_trajectories:
+        if trajectories is not None and index < save_trajectories:
             trajectories.append(result)
-
     return results, trajectories
 
 
-def summarise_results(
-    results: list[dict], device: str
-) -> dict:
-    """Compute summary statistics from Monte Carlo runs."""
-    lifetimes = np.array([r["total_lifetime_days"] for r in results])
+def _km_quantile(times: np.ndarray, observed: np.ndarray, quantile: float) -> float:
+    """Kaplan--Meier lifetime quantile; NaN when follow-up is insufficient."""
+    survival = 1.0
+    target = 1.0 - quantile
+    for time in sorted(np.unique(times)):
+        at_risk = int(np.sum(times >= time))
+        events = int(np.sum((times == time) & observed))
+        if events:
+            survival *= 1.0 - events / at_risk
+        if survival <= target:
+            return float(time)
+    return np.nan
+
+
+def summarise_results(results: list[dict], device: str) -> dict:
+    times = np.array([r["total_lifetime_days"] for r in results], dtype=float)
+    observed = np.array([r["event_observed"] for r in results], dtype=bool)
     medium_counts = np.array([r["medium_maintenance_count"] for r in results])
     major_counts = np.array([r["major_maintenance_count"] for r in results])
-
+    median = _km_quantile(times, observed, 0.5)
+    low = _km_quantile(times, observed, 0.025)
+    high = _km_quantile(times, observed, 0.975)
     return {
         "device": device,
         "n_runs": len(results),
-        "median_lifetime_days": float(np.median(lifetimes)),
-        "mean_lifetime_days": float(np.mean(lifetimes)),
-        "std_lifetime_days": float(np.std(lifetimes, ddof=1)),
-        "ci95_low_days": float(np.quantile(lifetimes, 0.025)),
-        "ci95_high_days": float(np.quantile(lifetimes, 0.975)),
-        "ci50_low_days": float(np.quantile(lifetimes, 0.25)),
-        "ci50_high_days": float(np.quantile(lifetimes, 0.75)),
+        "observed_eol_runs": int(observed.sum()),
+        "right_censored_runs": int((~observed).sum()),
+        "right_censored_share": float((~observed).mean()),
+        "median_lifetime_days": median,
+        "ci95_low_days": low,
+        "ci95_high_days": high,
+        "max_followup_days": float(times.max()),
         "median_medium_count": float(np.median(medium_counts)),
         "median_major_count": float(np.median(major_counts)),
+        "median_annualized_cost": float(
+            np.median([r["annualized_cost"] for r in results])
+        ),
         "start_date": results[0]["start_date"],
-        "median_end_date": _ordinal_to_date_str(
-            _date_to_ordinal(results[0]["start_date"])
-            + int(np.median(lifetimes))
+        "median_end_date": (
+            _ordinal_to_date_str(
+                _date_to_ordinal(results[0]["start_date"]) + int(median)
+            )
+            if np.isfinite(median)
+            else None
         ),
     }
 
 
 def _date_to_ordinal(date_str: str) -> int:
-    """Convert ISO date string to Excel ordinal."""
-    from datetime import date
-
-    d = date.fromisoformat(date_str)
-    epoch = date(1899, 12, 30)
-    return (d - epoch).days
+    return (date.fromisoformat(date_str) - EXCEL_EPOCH).days
 
 
 def _ordinal_to_date_str(ordinal: int) -> str:
-    """Convert Excel ordinal to ISO date string."""
-    from datetime import date, timedelta
-
-    epoch = date(1899, 12, 30)
-    return (epoch + timedelta(days=ordinal)).isoformat()
+    return (EXCEL_EPOCH + timedelta(days=int(ordinal))).isoformat()
