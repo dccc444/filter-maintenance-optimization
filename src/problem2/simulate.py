@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, timedelta
+from typing import Callable
 
 import numpy as np
 
 from .model import FilterParams, MaintenanceSchedule
 
 EXCEL_EPOCH = date(1899, 12, 30)
+MaintenanceDecision = Callable[[dict], str | None]
 
 
 def _ordinal_to_doy(ordinal: int) -> int:
@@ -108,8 +110,16 @@ def simulate_one_device(
     purchase_cost: float = 300.0,
     medium_cost: float = 3.0,
     major_cost: float = 12.0,
+    maintenance_decision: MaintenanceDecision | None = None,
 ) -> dict:
-    """Simulate one device until the two-condition end-of-life rule or censoring."""
+    """Simulate one device until the two-condition end-of-life rule or censoring.
+
+    When ``maintenance_decision`` is omitted, the observed fixed schedule is
+    continued. A supplied decision rule receives the current observable and
+    latent state after each day's measurement and returns ``"中维护"``,
+    ``"大维护"`` or ``None``. This preserves the Problem 2 physics while
+    allowing Problem 3 to compare condition-based policies.
+    """
     start_day = int(prediction_start_ordinal)
     start_doy = _ordinal_to_doy(start_day)
     S0 = seasonal_effect(start_doy, params)
@@ -127,13 +137,17 @@ def simulate_one_device(
         F = max(params.beta * params.days_since_maintenance, 0.0)
         C = params.recent_level + F - S0
 
-    events = generate_maintenance_dates(
-        start_day,
-        schedule,
-        rng,
-        max_years=max_years,
-        days_since_last=params.days_since_maintenance,
-        mediums_since_major=params.mediums_since_major,
+    events = (
+        generate_maintenance_dates(
+            start_day,
+            schedule,
+            rng,
+            max_years=max_years,
+            days_since_last=params.days_since_maintenance,
+            mediums_since_major=params.mediums_since_major,
+        )
+        if maintenance_decision is None
+        else []
     )
     event_idx = 0
     window_365 = list(warmup_history[-365:]) if warmup_history else []
@@ -141,8 +155,13 @@ def simulate_one_device(
     daily_day: list[int] = []
     medium_count = 0
     major_count = 0
+    mediums_since_major = int(max(params.mediums_since_major, 0))
+    days_since_event = int(max(round(params.days_since_maintenance), 0))
+    maintenance_events: list[tuple[int, str]] = []
     terminated = False
     final_post_major_mean = np.nan
+    annual_below_threshold_days = 0
+    minimum_annual_mean = np.inf
     day = start_day
     max_days = int(round(max_years * 365.25))
 
@@ -162,20 +181,59 @@ def simulate_one_device(
         if len(window_365) > 365:
             window_365.pop(0)
 
-        while event_idx < len(events) and day >= events[event_idx][0]:
-            event_type = events[event_idx][1]
-            event_idx += 1
+        annual_mean = (
+            float(np.mean(window_365)) if len(window_365) == 365 else np.nan
+        )
+        if np.isfinite(annual_mean):
+            minimum_annual_mean = min(minimum_annual_mean, annual_mean)
+            if annual_mean < threshold:
+                annual_below_threshold_days += 1
+
+        event_types_today: list[str] = []
+        if maintenance_decision is None:
+            while event_idx < len(events) and day >= events[event_idx][0]:
+                event_types_today.append(events[event_idx][1])
+                event_idx += 1
+        else:
+            recent_7d = float(np.mean(daily_p[-7:]))
+            decision = maintenance_decision(
+                {
+                    "day": day,
+                    "day_of_year": _ordinal_to_doy(day),
+                    "C": float(C),
+                    "F": float(F),
+                    "permeability": float(P),
+                    "recent_7d_mean": recent_7d,
+                    "annual_mean": annual_mean,
+                    "days_since_event": days_since_event,
+                    "mediums_since_major": mediums_since_major,
+                    "params": params,
+                }
+            )
+            if decision not in (None, "中维护", "大维护"):
+                raise ValueError(f"Unknown maintenance decision: {decision}")
+            if decision is not None:
+                event_types_today.append(decision)
+
+        for event_type in event_types_today:
+            maintenance_events.append((day, event_type))
             if event_type == "中维护":
                 medium_count += 1
+                mediums_since_major += 1
                 C -= params.medium_damage
                 F = max(F - params.medium_recovery, 0.0)
             else:
                 major_count += 1
+                mediums_since_major = 0
                 C -= params.major_damage
                 F = max(F - params.major_recovery, 0.0)
                 major_today = True
+            days_since_event = 0
 
-        if len(window_365) == 365 and float(np.mean(window_365)) < threshold:
+        if not event_types_today:
+            days_since_event += 1
+
+        if len(window_365) == 365 and annual_mean < threshold:
             final_post_major_mean = expected_post_major_mean(
                 C,
                 F,
@@ -211,6 +269,10 @@ def simulate_one_device(
         "mean_simulated_permeability": (
             float(np.mean(daily_p)) if daily_p else np.nan
         ),
+        "minimum_annual_mean": (
+            float(minimum_annual_mean) if np.isfinite(minimum_annual_mean) else np.nan
+        ),
+        "annual_below_threshold_days": annual_below_threshold_days,
         "final_C": float(C),
         "final_F": float(F),
         "total_cost": float(total_cost),
@@ -221,6 +283,7 @@ def simulate_one_device(
     if return_trajectory:
         result["daily_P"] = daily_p
         result["daily_day"] = daily_day
+        result["maintenance_events"] = maintenance_events
     return result
 
 

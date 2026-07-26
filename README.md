@@ -52,6 +52,38 @@ outputs/problem2/
 
 论文正文位于 `paper/第一问论文正文.md` 和 `paper/第二问论文正文.md`。
 
+## 第三问：最优维护方案
+
+- 直接复用第二问退化模型和双条件寿命判据
+- 比较固定周期、透水率触发和状态触发三类共 39 组候选
+- 采用更新报酬口径计算长期年均成本
+- 40 次蒙特卡洛筛选，300 次蒙特卡洛复核
+- 对维护损伤占比 0%、20%、40% 进行稳健性检查
+- 输出设备级可执行维护规则及第四问可复用的全部候选结果
+
+运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m src.problem3.run
+```
+
+主要输出：
+
+```text
+outputs/problem3/
+├─ tables/
+│  ├─ candidate_screening.csv
+│  ├─ selected_policies.csv
+│  ├─ strategy_comparison.csv
+│  ├─ portfolio_summary.csv
+│  └─ damage_scenario_robustness.csv
+├─ figures/
+├─ recommended_policy.json
+└─ 第三问分析报告.md
+```
+
+第三问论文正文位于 `paper/第三问论文正文.md`。
+
 ## 数据
 
 原始题目附件位于 `B题附件/`：
